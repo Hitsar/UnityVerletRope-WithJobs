@@ -1,7 +1,8 @@
-using System;
-using System.Collections;
-using System.Collections.Generic;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
 using UnityEngine;
+using UnityEngine.Profiling;
 
 [RequireComponent(typeof(MeshRenderer))]
 [RequireComponent(typeof(MeshFilter))]
@@ -21,6 +22,9 @@ public class RopeRenderer : MonoBehaviour
     private int m_NodeCount;
     private bool m_IsInitialized;
 
+    private ComputeVerticesJob _computeVerticesJob;
+    private ComputeTrianglesJob _computeTrianglesJob;
+
     private void Awake()
     {
         m_MeshFilter = GetComponent<MeshFilter>();
@@ -29,6 +33,9 @@ public class RopeRenderer : MonoBehaviour
         m_RopeMesh = new Mesh();
         m_Angle = ((m_RopeSegmentSides - 2) * 180) / m_RopeSegmentSides;
         m_IsInitialized = false;
+
+        _computeVerticesJob = new ComputeVerticesJob();
+        _computeTrianglesJob = new ComputeTrianglesJob();
     }
 
     private void Start()
@@ -38,37 +45,14 @@ public class RopeRenderer : MonoBehaviour
         m_Triangles = new int[m_RopeSegmentSides * (m_Rope.GetNodeCount() - 1) * 6];
     }
 
-    // private void OnDrawGizmos()
-    // {
-    //     if (!Application.isPlaying)
-    //         return;
-    //
-    //     if (m_Vertices is null || m_Triangles is null)
-    //         return;
-    //
-    //
-    //     foreach (var vert in m_Vertices)
-    //     {
-    //         Gizmos.color = Color.white;
-    //         Gizmos.DrawSphere(vert, 0.01f);
-    //     }
-    //
-    //     for (int i = 0; i < m_Triangles.Length - 3; i += 3)
-    //     {
-    //         Gizmos.DrawLine(m_Vertices[m_Triangles[i]], m_Vertices[m_Triangles[i + 1]]);
-    //         Gizmos.DrawLine(m_Vertices[m_Triangles[i + 1]], m_Vertices[m_Triangles[i + 2]]);
-    //         Gizmos.DrawLine(m_Vertices[m_Triangles[i + 2]], m_Vertices[m_Triangles[i]]);
-    //     }
-    // }
-
     public void RenderRope(VerletNode[] nodes, float radius)
     {
-        if (m_Vertices is null || m_Triangles is null)
-            return;
-
+        if (m_Vertices is null || m_Triangles is null) return;
+        
         ComputeVertices(nodes, radius);
         
-        if(!m_IsInitialized){
+        if(!m_IsInitialized)
+        {
             ComputeTriangles();
             m_IsInitialized = true;
         }
@@ -80,40 +64,82 @@ public class RopeRenderer : MonoBehaviour
     {
         var angle = (360f / m_RopeSegmentSides) * Mathf.Deg2Rad;
 
-        for (int i = 0; i < m_Vertices.Length; i++)
+        _computeVerticesJob.Angle = angle;
+        _computeVerticesJob.Radius = radius;
+        _computeVerticesJob.RopeSegmentSides = m_RopeSegmentSides;
+        
+        var nodesNative = new NativeArray<VerletNode>(nodes, Allocator.TempJob);
+        _computeVerticesJob.Nodes = nodesNative;
+        
+        var vertices = new NativeArray<Vector3>(m_Vertices, Allocator.TempJob);
+        _computeVerticesJob.Vertices = vertices;
+        
+        _computeVerticesJob.Schedule(m_Vertices.Length, 6).Complete();
+        
+        m_Vertices = vertices.ToArray();
+
+        nodesNative.Dispose();
+        vertices.Dispose();
+    }
+    
+    [BurstCompile]
+    private struct ComputeVerticesJob: IJobParallelFor
+    {
+        [ReadOnly] public float Radius;
+        [ReadOnly] public float Angle;
+        [ReadOnly] public int RopeSegmentSides;
+        [ReadOnly] public NativeArray<VerletNode> Nodes;
+        [WriteOnly] public NativeArray<Vector3> Vertices;
+        
+        public void Execute(int i)
         {
-            var nodeindex = i / m_RopeSegmentSides;
-            var sign = nodeindex == nodes.Length - 1 ? -1 : 1;
-            Debug.Log($"Node Index: {nodeindex}, Vert Index: {i} , {m_Vertices[i]}");
+            var nodeindex = i / RopeSegmentSides;
+            var sign = nodeindex == Nodes.Length - 1 ? -1 : 1;
             
-            var currNodePosition = nodes[nodeindex].Position;
+            var currNodePosition = Nodes[nodeindex].Position;
             var normalOfPlane =
-                (sign * nodes[nodeindex].Position + -sign * nodes[nodeindex + (nodeindex == nodes.Length - 1 ? -1 : 1)].Position)
+                (sign * Nodes[nodeindex].Position + -sign * Nodes[nodeindex + (nodeindex == Nodes.Length - 1 ? -1 : 1)].Position)
                 .normalized;
 
             var u = Vector3.Cross(normalOfPlane, Vector3.forward).normalized;
             var v = Vector3.Cross(u, normalOfPlane).normalized;
 
-            m_Vertices[i] = currNodePosition + radius * (float)Math.Cos(angle * (i % m_RopeSegmentSides)) * u +
-                            radius * (float)Math.Sin(angle * (i % m_RopeSegmentSides)) * v;
+            Vertices[i] = currNodePosition + Radius * Mathf.Cos(Angle * (i % RopeSegmentSides)) * u +
+                            Radius * Mathf.Sin(Angle * (i % RopeSegmentSides)) * v;
         }
     }
 
     private void ComputeTriangles()
     {
-        var tn = 0;
+        _computeTrianglesJob.tn = 0;
+        _computeTrianglesJob.RopeSegmentSides = m_RopeSegmentSides;
+        var triangles = new NativeArray<int>(m_Triangles, Allocator.TempJob);
+        _computeTrianglesJob.Triangles = triangles;
+        
+        _computeTrianglesJob.Schedule(m_Vertices.Length - m_RopeSegmentSides, 6).Complete();
 
-        for (int i = 0; i < m_Vertices.Length - m_RopeSegmentSides; i++)
+        m_Triangles = triangles.ToArray();
+        triangles.Dispose();
+    }
+    
+    [BurstCompile]
+    private struct ComputeTrianglesJob : IJobParallelFor
+    {
+        public int tn;
+        [ReadOnly] public int RopeSegmentSides;
+        [NativeDisableParallelForRestriction] public NativeArray<int> Triangles;
+        
+        public void Execute(int i)
         {
-            var nexti = (i + 1) % m_RopeSegmentSides == 0 ? i - m_RopeSegmentSides + 1 : i + 1;
+            var nexti = (i + 1) % RopeSegmentSides == 0 ? i - RopeSegmentSides + 1 : i + 1;
 
-            m_Triangles[tn] = i;
-            m_Triangles[tn + 1] = nexti + m_RopeSegmentSides;
-            m_Triangles[tn + 2] = i + m_RopeSegmentSides;
+            Triangles[tn] = i;
+            Triangles[tn + 1] = nexti + RopeSegmentSides;
+            Triangles[tn + 2] = i + RopeSegmentSides;
 
-            m_Triangles[tn + 3] = i;
-            m_Triangles[tn + 4] = nexti;
-            m_Triangles[tn + 5] = nexti + m_RopeSegmentSides;
+            Triangles[tn + 3] = i;
+            Triangles[tn + 4] = nexti;
+            Triangles[tn + 5] = nexti + RopeSegmentSides;
 
             tn += 6;
         }

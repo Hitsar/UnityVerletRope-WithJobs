@@ -1,5 +1,7 @@
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
 using UnityEngine;
-using UnityEngine.Serialization;
 
 public struct VerletNode
 {
@@ -20,10 +22,23 @@ public class VerletRope : MonoBehaviour
 
     private RopeRenderer m_RopeRenderer;
 
+    private CalculateNewPositionsJob _calculateNewPositionsJob;
+    private FixNodeDistancesJob _fixNodeDistancesJob;
+
     private void Awake()
     {
-        m_VerletNodes = new VerletNode[(int)(m_NumberOfNodes)];
+        m_VerletNodes = new VerletNode[m_NumberOfNodes];
         m_DistanceBetweenNodes = m_RopeLength / m_NumberOfNodes;
+
+        // _calculateNewPositionsJob = new CalculateNewPositionsJob
+        // {
+        //     GravityStep = m_Gravity,
+        //     RopeRadius = m_RopeRadius
+        // };
+        // _fixNodeDistancesJob = new FixNodeDistancesJob
+        // {
+        //     DistanceBetweenNodes = m_DistanceBetweenNodes,
+        // };
 
         for (int i = 0; i < m_VerletNodes.Length; i++)
         {
@@ -53,24 +68,6 @@ public class VerletRope : MonoBehaviour
         m_RopeRenderer.RenderRope(m_VerletNodes, m_RopeRadius);
     }
 
-    // private void OnDrawGizmos()
-    // {
-    //     if (!Application.isPlaying)
-    //         return;
-    //
-    //     for (int i = 0; i < m_VerletNodes.Length; i++)
-    //     {
-    //         if (i != m_VerletNodes.Length - 1)
-    //         {
-    //             Gizmos.color = Color.green;
-    //             Gizmos.DrawLine(m_VerletNodes[i].Position, m_VerletNodes[i + 1].Position);
-    //         }
-    //         
-    //         Gizmos.color = Color.blue;
-    //         Gizmos.DrawLine(m_VerletNodes[i].Position, m_VerletNodes[i].PrevoiusPosition);
-    //     }
-    // }
-
     private void CalculateNewPositions(float deltaTime)
     {
         Vector3 gravityStep = m_Gravity * (deltaTime * deltaTime);
@@ -94,12 +91,49 @@ public class VerletRope : MonoBehaviour
             m_VerletNodes[i].PrevoiusPosition = newPreviousPosition;
             m_VerletNodes[i].Position = newPosition;
         }
+        
+        // var verletNodes = new NativeArray<VerletNode>(m_VerletNodes, Allocator.TempJob);
+        //
+        // _calculateNewPositionsJob.VerletNodes = verletNodes;
+        // _calculateNewPositionsJob.Schedule(m_VerletNodes.Length, 4).Complete();
+        //
+        // m_VerletNodes = verletNodes.ToArray();
+        // verletNodes.Dispose();
+    }
+    
+    [BurstCompile]
+    private struct CalculateNewPositionsJob : IJobParallelFor
+    {
+        [ReadOnly] public Vector3 GravityStep;
+        [ReadOnly] public float RopeRadius;
+        public NativeArray<VerletNode> VerletNodes;
+        
+        public void Execute(int i)
+        {
+            var currNode = VerletNodes[i];
+            var newPreviousPosition = currNode.Position;
+
+            var newPosition = (2 * currNode.Position) - currNode.PrevoiusPosition + GravityStep;
+
+            Vector3 direction = newPosition - currNode.Position;
+            float distance = direction.magnitude;
+            direction.Normalize();
+
+            if (Physics.SphereCast(currNode.Position, RopeRadius, direction, out RaycastHit hit, distance))
+            {
+                newPosition = hit.point + hit.normal * RopeRadius;
+            }
+
+            currNode.PrevoiusPosition = newPreviousPosition;
+            currNode.Position = newPosition;
+            VerletNodes[i] = currNode;
+        }
     }
 
     private void FixNodeDistances()
     {
         m_VerletNodes[0].Position = transform.position;
-
+        
         for (int i = 0; i < m_VerletNodes.Length - 1; i++)
         {
             var n1 = m_VerletNodes[i];
@@ -111,6 +145,37 @@ public class VerletRope : MonoBehaviour
 
             m_VerletNodes[i].Position -= (d1 * (0.5f * d3));
             m_VerletNodes[i + 1].Position += (d1 * (0.5f * d3));
+        }
+
+        // var verletNodes = new NativeArray<VerletNode>(m_VerletNodes, Allocator.TempJob);
+        //
+        // _fixNodeDistancesJob.VerletNodes = verletNodes;
+        // _fixNodeDistancesJob.Schedule(m_VerletNodes.Length - 1, 6).Complete();
+        //
+        // m_VerletNodes = verletNodes.ToArray();
+        // verletNodes.Dispose();
+    }
+    
+    [BurstCompile]
+    private struct FixNodeDistancesJob : IJobParallelFor
+    {
+        [ReadOnly] public float DistanceBetweenNodes;
+        [NativeDisableParallelForRestriction] public NativeArray<VerletNode> VerletNodes;
+    
+        public void Execute(int i)
+        {
+            var n1 = VerletNodes[i];
+            var n2 = VerletNodes[i + 1];
+    
+            var d1 = n1.Position - n2.Position;
+            var d2 = d1.magnitude;
+            var d3 = (d2 - DistanceBetweenNodes) / d2;
+    
+            n1.Position -= (d1 * (0.5f * d3));
+            n2.Position += (d1 * (0.5f * d3));
+    
+            VerletNodes[i] = n1;
+            VerletNodes[i + 1] = n2;
         }
     }
 
@@ -143,8 +208,5 @@ public class VerletRope : MonoBehaviour
         }
     }
 
-    public int GetNodeCount()
-    {
-        return m_VerletNodes.Length;
-    }
+    public int GetNodeCount() => m_VerletNodes.Length;
 }
